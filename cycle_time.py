@@ -14,12 +14,13 @@ Methodology:
   - Cycle time = working days in ACTIVE statuses only
   - Weekends + Portuguese public holidays excluded
   - Blocked AND Test Blocked both excluded from cycle time, tracked separately
-  - Ready / To Do / Backlog etc. excluded (inactive)
-  - Epics and Discarded tickets are excluded from all metrics
+  - Ready / To Do / Backlog / Ready for Testing etc. excluded (inactive)
+  - Epics, Bugs, Defects and Discarded tickets are excluded from all metrics
+  - Cycle end = "Done", "Closed", "Resolved" OR "Ready for Production"
+  - Report = weekly, looking at the last 12 weeks
 """
 
 import os
-import math
 import requests
 import concurrent.futures
 from calendar import monthrange
@@ -48,11 +49,11 @@ EXCLUDED_ISSUE_TYPES = {"epic", "bug", "defect"}
 INACTIVE_STATUSES = {
     "to do", "open", "backlog", "new",
     "selected for development", "ready",
-    "ready for testing",   # waiting for QA to pick up — NOT active work
+    "ready for testing",   # waiting for QA — NOT active work
 }
 # Both "blocked" AND "test blocked" excluded from cycle time, tracked separately
 BLOCKED_STATUSES = {"blocked", "test blocked"}
-DONE_STATUSES    = {"done", "closed", "resolved"}
+DONE_STATUSES    = {"done", "closed", "resolved", "ready for production"}
 
 AUTH    = (JIRA_EMAIL, JIRA_TOKEN)
 HEADERS = {"Accept": "application/json"}
@@ -60,7 +61,6 @@ HEADERS = {"Accept": "application/json"}
 # ── Portuguese Public Holidays ─────────────────────────────────────────────────
 
 def easter_date(year):
-    """Meeus/Jones/Butcher algorithm — returns UTC datetime of Easter Sunday."""
     a = year % 19; b = year // 100; c = year % 100
     d = b // 4;    e = b % 4
     f = (b + 8) // 25
@@ -77,7 +77,6 @@ def easter_date(year):
 _holiday_cache = {}
 
 def pt_holidays(year):
-    """Returns a set of 'YYYY-MM-DD' strings for PT national holidays."""
     if year in _holiday_cache:
         return _holiday_cache[year]
     easter      = easter_date(year)
@@ -85,35 +84,22 @@ def pt_holidays(year):
     corpus      = easter + timedelta(days=60)
     fmt = lambda d: d.strftime("%Y-%m-%d")
     holidays = {
-        f"{year}-01-01",  # New Year's Day
-        f"{year}-04-25",  # Freedom Day
-        f"{year}-05-01",  # Labour Day
-        f"{year}-06-10",  # Portugal Day
-        f"{year}-08-15",  # Assumption of Mary
-        f"{year}-10-05",  # Republic Day
-        f"{year}-11-01",  # All Saints' Day
-        f"{year}-12-01",  # Restoration of Independence
-        f"{year}-12-08",  # Immaculate Conception
-        f"{year}-12-25",  # Christmas
-        fmt(good_friday),
-        fmt(corpus),
+        f"{year}-01-01", f"{year}-04-25", f"{year}-05-01",
+        f"{year}-06-10", f"{year}-08-15", f"{year}-10-05",
+        f"{year}-11-01", f"{year}-12-01", f"{year}-12-08",
+        f"{year}-12-25", fmt(good_friday), fmt(corpus),
     }
     _holiday_cache[year] = holidays
     return holidays
 
 
 def is_working_day(dt):
-    """True if dt (UTC datetime) is a working day (Mon–Fri, not a PT holiday)."""
     if dt.weekday() >= 5:
         return False
     return dt.strftime("%Y-%m-%d") not in pt_holidays(dt.year)
 
 
 def working_days_between(start_dt, end_dt):
-    """
-    Fractional working days between two UTC datetimes.
-    Iterates day-by-day, clamping the overlap per day to [start_dt, end_dt].
-    """
     if end_dt <= start_dt:
         return 0.0
     DAY_SECS = 86_400.0
@@ -129,7 +115,6 @@ def working_days_between(start_dt, end_dt):
 
 
 def working_weeks_in_range(start_str, end_str):
-    """Working days in [start, end] inclusive ÷ 5."""
     start = datetime.strptime(start_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     end   = datetime.strptime(end_str,   "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(hours=23, minutes=59, seconds=59)
     days  = 0
@@ -154,11 +139,8 @@ def jira_get(path, params=None):
 
 def get_all_issues(jql):
     """
-    Paginate using search/jql endpoint.
-
-    FILTERING RULE: Only include tickets where:
-      - Story Points > 0 (customfield_10016 or customfield_10004), OR
-      - fixVersions is non-empty
+    Paginate Jira search.
+    Only includes tickets with Story Points > 0 OR fixVersions non-empty.
     """
     issues, page_token, page = [], None, 1
     print(f"  JQL: {jql}")
@@ -168,9 +150,9 @@ def get_all_issues(jql):
             "maxResults": 100,
             "fields":     "summary,project,created,resolutiondate,issuetype,"
                           "fixVersions,"
-                          "customfield_10004,customfield_10016,"   # story points
-                          "customfield_16256,"                     # AC Failed
-                          "customfield_21332",                     # AI Dev Assist
+                          "customfield_10004,customfield_10016,"
+                          "customfield_16256,"
+                          "customfield_21332",
         }
         if page_token:
             params["nextPageToken"] = page_token
@@ -185,15 +167,14 @@ def get_all_issues(jql):
             break
         page += 1
 
-    # ── Apply SP > 0 OR Fix Version filter ────────────────────────────────────
-    before = len(issues)
+    before   = len(issues)
     filtered = []
     for i in issues:
-        sp = (i["fields"].get("customfield_10016")
-           or i["fields"].get("customfield_10004"))
-        has_sp  = sp is not None and float(sp) > 0
-        fv      = i["fields"].get("fixVersions") or []
-        has_fv  = isinstance(fv, list) and len(fv) > 0
+        sp     = (i["fields"].get("customfield_10016")
+               or i["fields"].get("customfield_10004"))
+        has_sp = sp is not None and float(sp) > 0
+        fv     = i["fields"].get("fixVersions") or []
+        has_fv = isinstance(fv, list) and len(fv) > 0
         if has_sp or has_fv:
             filtered.append(i)
 
@@ -224,11 +205,8 @@ def get_changelog(issue_key):
         ac_failed = ac_val.lower() == "yes"
 
     ai_field = fields.get("customfield_21332") or []
-    if isinstance(ai_field, list):
-        ai_tools = [v.get("value", str(v)) if isinstance(v, dict) else str(v)
-                    for v in ai_field]
-    else:
-        ai_tools = []
+    ai_tools = [v.get("value", str(v)) if isinstance(v, dict) else str(v)
+                for v in ai_field] if isinstance(ai_field, list) else []
 
     fix_versions = [v.get("name", "") for v in (fields.get("fixVersions") or [])]
 
@@ -244,10 +222,6 @@ def get_changelog(issue_key):
 # ── Open Bugs ──────────────────────────────────────────────────────────────────
 
 def get_open_bugs():
-    """
-    Fetch all open Bugs and Defects across the 4 projects.
-    Excludes: Done, Discarded, Ready for Production.
-    """
     jql = (
         'project in (CAECS, GTM, DTAL, DTK) '
         'AND issuetype in (Bug, Defect) '
@@ -256,9 +230,8 @@ def get_open_bugs():
     issues, page_token = [], None
     while True:
         params = {
-            "jql":        jql,
-            "maxResults": 100,
-            "fields":     "project,priority,status",
+            "jql": jql, "maxResults": 100,
+            "fields": "project,priority,status",
         }
         if page_token:
             params["nextPageToken"] = page_token
@@ -274,7 +247,6 @@ def get_open_bugs():
     by_project  = {p: 0 for p in PROJECTS}
     high_urgent = 0
     blocked     = 0
-
     for i in issues:
         proj     = i["fields"]["project"]["key"]
         priority = (i["fields"].get("priority") or {}).get("name", "").lower()
@@ -287,10 +259,8 @@ def get_open_bugs():
             blocked += 1
 
     return {
-        "total":       len(issues),
-        "by_project":  by_project,
-        "high_urgent": high_urgent,
-        "blocked":     blocked,
+        "total": len(issues), "by_project": by_project,
+        "high_urgent": high_urgent, "blocked": blocked,
     }
 
 
@@ -299,21 +269,12 @@ def get_open_bugs():
 def classify_status(name):
     n = name.lower().strip()
     if n in DONE_STATUSES:     return "done"
-    if n in BLOCKED_STATUSES:  return "blocked"   # includes "test blocked"
+    if n in BLOCKED_STATUSES:  return "blocked"
     if n in INACTIVE_STATUSES: return "inactive"
     return "active"
 
 
 def compute_cycle_time(histories):
-    """
-    Walk status transitions in chronological order.
-    Returns (cycle_days, blocked_days, in_progress_days, status_log).
-
-    Active      = counted towards cycle time
-    In Progress = subset of Active, tracked separately for Efficiency metric
-    Blocked     = "Blocked" OR "Test Blocked" — excluded from cycle, tracked separately
-    Inactive    = To Do, Ready, Backlog, etc. — excluded entirely
-    """
     transitions = []
     for h in histories:
         for item in h.get("items", []):
@@ -334,35 +295,27 @@ def compute_cycle_time(histories):
         frm_type = classify_status(t["from"])
 
         if to_type == "blocked":
-            # Leaving active → entering blocked
             if active_from:
                 d = working_days_between(active_from, t["date"])
                 cycle_wd += d
                 if t["from"].lower().strip() == "in progress":
                     in_progress_wd += d
-                status_log.append({
-                    "from": t["from"], "to": t["to"],
-                    "counted": "✅ Active",
-                    "days": round(d, 2),
+                status_log.append({"from": t["from"], "to": t["to"],
+                    "counted": "✅ Active", "days": round(d, 2),
                     "entered": active_from.strftime("%Y-%m-%d"),
-                    "exited":  t["date"].strftime("%Y-%m-%d"),
-                })
+                    "exited":  t["date"].strftime("%Y-%m-%d")})
                 active_from = None
             if not blocked_from:
                 blocked_from = t["date"]
 
         elif frm_type == "blocked":
-            # Leaving blocked
             if blocked_from:
                 d = working_days_between(blocked_from, t["date"])
                 blocked_wd += d
-                status_log.append({
-                    "from": t["from"], "to": t["to"],
-                    "counted": "🚫 Blocked",
-                    "days": round(d, 2),
+                status_log.append({"from": t["from"], "to": t["to"],
+                    "counted": "🚫 Blocked", "days": round(d, 2),
                     "entered": blocked_from.strftime("%Y-%m-%d"),
-                    "exited":  t["date"].strftime("%Y-%m-%d"),
-                })
+                    "exited":  t["date"].strftime("%Y-%m-%d")})
                 blocked_from = None
             if to_type == "active":
                 active_from = t["date"]
@@ -373,24 +326,18 @@ def compute_cycle_time(histories):
                 cycle_wd += d
                 if t["from"].lower().strip() == "in progress":
                     in_progress_wd += d
-                status_log.append({
-                    "from": t["from"], "to": t["to"],
-                    "counted": "✅ Active",
-                    "days": round(d, 2),
+                status_log.append({"from": t["from"], "to": t["to"],
+                    "counted": "✅ Active", "days": round(d, 2),
                     "entered": active_from.strftime("%Y-%m-%d"),
-                    "exited":  t["date"].strftime("%Y-%m-%d"),
-                })
+                    "exited":  t["date"].strftime("%Y-%m-%d")})
                 active_from = None
             if blocked_from:
                 d = working_days_between(blocked_from, t["date"])
                 blocked_wd += d
-                status_log.append({
-                    "from": t["from"], "to": t["to"],
-                    "counted": "🚫 Blocked",
-                    "days": round(d, 2),
+                status_log.append({"from": t["from"], "to": t["to"],
+                    "counted": "🚫 Blocked", "days": round(d, 2),
                     "entered": blocked_from.strftime("%Y-%m-%d"),
-                    "exited":  t["date"].strftime("%Y-%m-%d"),
-                })
+                    "exited":  t["date"].strftime("%Y-%m-%d")})
                 blocked_from = None
 
         elif to_type == "active" and not active_from and not blocked_from:
@@ -401,13 +348,10 @@ def compute_cycle_time(histories):
             cycle_wd += d
             if t["from"].lower().strip() == "in progress":
                 in_progress_wd += d
-            status_log.append({
-                "from": t["from"], "to": t["to"],
-                "counted": "✅ Active",
-                "days": round(d, 2),
+            status_log.append({"from": t["from"], "to": t["to"],
+                "counted": "✅ Active", "days": round(d, 2),
                 "entered": active_from.strftime("%Y-%m-%d"),
-                "exited":  t["date"].strftime("%Y-%m-%d"),
-            })
+                "exited":  t["date"].strftime("%Y-%m-%d")})
             active_from = None
 
     return round(cycle_wd, 1), round(blocked_wd, 1), round(in_progress_wd, 1), status_log
@@ -429,9 +373,8 @@ def la(): return Alignment(horizontal="left",   vertical="center", wrap_text=Tru
 def fl(c): return PatternFill("solid", start_color=c, fgColor=c)
 
 
-def export_excel(results, tickets, year, month, weeks):
-    label = datetime(year, month, 1).strftime("%B %Y")
-    wb    = Workbook()
+def export_excel(results, tickets, label, weeks, end_dt):
+    wb = Workbook()
 
     # ── Sheet 1: Summary ──────────────────────────────────────────────────────
     ws = wb.active
@@ -444,18 +387,18 @@ def export_excel(results, tickets, year, month, weeks):
     ws.row_dimensions[1].height = 30
 
     ws.merge_cells("A2:H2")
-    ws["A2"] = ("Working days only · Ready, Blocked & Test Blocked excluded · "
-                "weekends & 🇵🇹 PT holidays excluded · "
-                "only tickets with SP > 0 or Fix Version")
+    ws["A2"] = ("Working days only · Done OR Ready for Production · "
+                "Blocked, Test Blocked & Ready for Testing excluded · "
+                "weekends & 🇵🇹 PT holidays excluded · SP > 0 or Fix Version · last 12 weeks")
     ws["A2"].font = Font(name="Arial", italic=True, size=10, color="94A3B8")
     ws["A2"].fill = fl(C_HEADER); ws["A2"].alignment = ca()
     ws.row_dimensions[2].height = 16
 
-    ws.append([])  # row 3 blank
+    ws.append([])
 
     hdrs = ["Project", "Tickets", "AVG Cycle (d)", "AVG Blocked (d)",
             "Throughput (SP/wk)", "Rework Rate", "AI Assist %", "Efficiency %", "Devs"]
-    ws.append(hdrs)  # row 4
+    ws.append(hdrs)
     for col, h in enumerate(hdrs, 1):
         c = ws.cell(row=4, column=col)
         c.font = hf(); c.fill = fl(C_PROJ); c.alignment = ca(); c.border = bdr()
@@ -465,10 +408,7 @@ def export_excel(results, tickets, year, month, weeks):
         row = 5 + idx
         f   = fl(C_ALT if idx % 2 == 0 else C_WHITE)
         vals = [
-            p["project"],
-            p["count"],
-            p["avg"],
-            p["avg_blocked"],
+            p["project"], p["count"], p["avg"], p["avg_blocked"],
             "N/A (SP<50%)" if p["sp_na"] else (p["throughput_sp"] if p["throughput_sp"] is not None else "—"),
             f"{p['rework_rate']}%" if p["rework_rate"] is not None else "—",
             f"{p['ai_rate']}%"     if p["ai_rate"]     is not None else "—",
@@ -488,9 +428,9 @@ def export_excel(results, tickets, year, month, weeks):
 
     # ── Sheet 2: All Tickets ──────────────────────────────────────────────────
     ws2 = wb.create_sheet("🎫 All Tickets")
-    ws2.merge_cells("A1:J1")
+    ws2.merge_cells("A1:K1")
     ws2["A1"] = (f"All Tickets — {label} ({len(tickets)} total) · "
-                 "Working days, weekends & PT holidays excluded · SP > 0 or Fix Version only")
+                 "Working days · SP > 0 or Fix Version · Done or Ready for Production")
     ws2["A1"].font = Font(name="Arial", bold=True, size=13, color="FFFFFF")
     ws2["A1"].fill = fl(C_HEADER); ws2["A1"].alignment = ca()
     ws2.row_dimensions[1].height = 26
@@ -515,19 +455,15 @@ def export_excel(results, tickets, year, month, weeks):
         fix_ver_str = ", ".join(t.get("fix_versions") or []) or "—"
         for col, val in enumerate([
             t["project"], t["summary"],
-            t.get("story_points", "—") or "—",
-            fix_ver_str,
-            t["cycle"],
-            t.get("in_progress", "—"),
-            t["blocked"],
+            t.get("story_points", "—") or "—", fix_ver_str,
+            t["cycle"], t.get("in_progress", "—"), t["blocked"],
             "🔁 Yes" if t.get("ac_failed") else "—",
             f"🤖 {', '.join(t.get('ai_tools', []))}" if t.get("ai_tools") else "—",
         ], 2):
             c = ws2.cell(row=row, column=col, value=val)
             c.font = bf(); c.fill = f
-            c.alignment = la() if col in (3,) else ca(); c.border = bdr()
+            c.alignment = la() if col == 3 else ca(); c.border = bdr()
 
-        # How counted column
         if t.get("status_log"):
             parts = [f"{s['from']}→{s['to']} ({s['counted']}: {s['days']}d)"
                      for s in t["status_log"] if s["days"] > 0]
@@ -581,11 +517,8 @@ def export_excel(results, tickets, year, month, weeks):
 
             fix_ver_str = ", ".join(t.get("fix_versions") or []) or "—"
             for col, val in enumerate([
-                t["summary"],
-                t.get("story_points", "—") or "—",
-                fix_ver_str,
-                t["cycle"],
-                t["blocked"],
+                t["summary"], t.get("story_points", "—") or "—",
+                fix_ver_str, t["cycle"], t["blocked"],
                 "🔁 Yes" if t.get("ac_failed") else "—",
             ], 2):
                 c = ws_p.cell(row=row, column=col, value=val)
@@ -606,7 +539,6 @@ def export_excel(results, tickets, year, month, weeks):
             hc2.font = Font(name="Arial", size=9, color="475569")
             hc2.fill = f; hc2.alignment = la(); hc2.border = bdr()
 
-        # AVG row
         ar = len(items) + 3
         ws_p[f"A{ar}"] = "AVG Cycle Time (wd)"
         ws_p[f"A{ar}"].font = Font(name="Arial", bold=True, size=11)
@@ -626,7 +558,7 @@ def export_excel(results, tickets, year, month, weeks):
         ws_p.column_dimensions["H"].width = 80
         ws_p.freeze_panes = "A3"
 
-    filename = f"cycle_time_report_{year}_{month:02d}.xlsx"
+    filename = f"cycle_time_report_w{end_dt.strftime('%Y%m%d')}_12wk.xlsx"
     wb.save(filename)
     print(f"\n📁 Excel saved: {filename}")
     return filename
@@ -677,13 +609,12 @@ def upload_to_confluence(filepath):
 # ── Slack ──────────────────────────────────────────────────────────────────────
 
 Q4_GOALS = {
-    "lead_time_wd":        5.0,
-    "throughput_growth":   20,
-    "rework_rate":         10,
-    "efficiency_min":      30,
-    "efficiency_max":      40,
-    "ai_assist":           50,
-    "open_bugs":           5,
+    "lead_time_wd":   5.0,
+    "rework_rate":    10,
+    "efficiency_min": 30,
+    "efficiency_max": 40,
+    "ai_assist":      50,
+    "open_bugs":      5,
 }
 
 def _goal_indicator(value, goal, lower_is_better=True):
@@ -704,10 +635,11 @@ def post_to_slack(report, confluence_url=None):
         return f"{sum(p['avg']*p['count'] for p in valid)/n:.1f}" if n else "N/A"
 
     lines = [
-        f"*📊 Monthly Cycle Time Report — {report['label']}*",
-        f"_Projects: {', '.join(PROJECTS)}_",
+        f"*📊 Weekly Cycle Time Report — {report['label']}*",
+        f"_Projects: {', '.join(PROJECTS)} · last 12 weeks_",
         f"_Working days only · Weekends & PT holidays excluded · "
-        f"Ready/Blocked/Test Blocked excluded · SP > 0 or Fix Version only_",
+        f"Ready/Blocked/Test Blocked/Ready for Testing excluded · "
+        f"Done or Ready for Production · SP > 0 or Fix Version_",
         "",
     ]
 
@@ -739,8 +671,8 @@ def post_to_slack(report, confluence_url=None):
         eff     = p.get("efficiency")
         eff_str = f"{eff}%" if eff is not None else "N/A"
         if eff is not None:
-            on_goal    = Q4_GOALS["efficiency_min"] <= eff <= Q4_GOALS["efficiency_max"]
-            eff_ind    = " ✅" if on_goal else " ⚠️"
+            on_goal = Q4_GOALS["efficiency_min"] <= eff <= Q4_GOALS["efficiency_max"]
+            eff_ind = " ✅" if on_goal else " ⚠️"
         else:
             eff_ind = ""
         eff_line = (f"Efficiency: *{eff_str}*{eff_ind} "
@@ -767,8 +699,7 @@ def post_to_slack(report, confluence_url=None):
     if isinstance(bugs_total, int):
         bugs_ind    = " ✅" if bugs_total <= bugs_goal else " ⚠️"
         by_proj_str = "  ·  ".join(
-            f"{proj}: {bugs['by_project'].get(proj, 0)}" for proj in PROJECTS
-        )
+            f"{proj}: {bugs['by_project'].get(proj, 0)}" for proj in PROJECTS)
         hi_str = f"  ·  High/Urgent: {bugs.get('high_urgent', 0)}" if bugs.get("high_urgent") else ""
         bl_str = f"  ·  Blocked: {bugs.get('blocked', 0)}"          if bugs.get("blocked")     else ""
         lines += [
@@ -790,8 +721,8 @@ def post_to_slack(report, confluence_url=None):
         f"        Lead Time AVG: *{ov}wd*{ov_ind} _(goal: <{goal_lt}wd)_ "
         f"across {report['total']} tickets · {report['weeks']:.1f} working weeks",
         "",
-        "_Cycle time = active working days · SP > 0 or Fix Version · "
-        "In Progress and equivalent statuses_",
+        "_Cycle time = active working days · Done or Ready for Production · "
+        "SP > 0 or Fix Version · last 12 weeks_",
     ]
 
     if confluence_url:
@@ -804,21 +735,33 @@ def post_to_slack(report, confluence_url=None):
 
 # ── Report ─────────────────────────────────────────────────────────────────────
 
-def run_report(year, month):
-    _, last_day = monthrange(year, month)
-    start = f"{year}-{month:02d}-01"
-    end   = f"{year}-{month:02d}-{last_day}"
-    label = datetime(year, month, 1).strftime("%B %Y")
+def run_report(week_end_date=None):
+    """
+    Weekly report covering the last 12 weeks up to week_end_date (default: today).
+    Tickets included if status changed to Done OR Ready for Production in that window.
+    """
+    if week_end_date is None:
+        week_end_date = date.today()
+
+    end_dt   = week_end_date
+    start_dt = end_dt - timedelta(weeks=12)
+
+    start = start_dt.strftime("%Y-%m-%d")
+    end   = end_dt.strftime("%Y-%m-%d")
+    label = f"W/E {end_dt.strftime('%b %d, %Y')} (last 12 weeks)"
     weeks = working_weeks_in_range(start, end)
 
     print(f"\n📊 Cycle Time Report — {label}  ({weeks:.1f} working weeks)")
+    print(f"    Period: {start} → {end}")
     print("=" * 60)
-    print("⚙️  Filter: SP > 0 OR Fix Version filled · Epics, Bugs, Defects & Discarded excluded")
+    print("⚙️  Filter: SP > 0 OR Fix Version · Epics, Bugs, Defects & Discarded excluded")
+    print("⚙️  Done = Done / Closed / Resolved / Ready for Production")
+    print("⚙️  Inactive = To Do / Ready / Ready for Testing / Backlog etc.")
     print("=" * 60)
 
     jql = (
         f'project in ({", ".join(PROJECTS)}) '
-        f'AND status changed to Done during ("{start}", "{end}") '
+        f'AND status changed to ("Done", "Ready for Production") during ("{start}", "{end}") '
         f'AND status != Discarded '
         f'AND issuetype not in (Epic, Bug, Defect)'
     )
@@ -826,7 +769,6 @@ def run_report(year, month):
     print("\n1. Fetching & filtering issues...")
     issues = get_all_issues(jql)
 
-    # Double-filter: exclude Epics in case JQL filter missed any
     before = len(issues)
     issues = [i for i in issues
               if (i["fields"].get("issuetype") or {}).get("name", "").lower()
@@ -871,18 +813,11 @@ def run_report(year, month):
         )
 
         entry = {
-            "key":          key,
-            "project":      proj,
-            "summary":      summary,
-            "cycle":        cycle,
-            "blocked":      blocked,
-            "in_progress":  in_progress,
-            "status_log":   status_log,
-            "story_points": sp,
-            "fix_versions": fix_versions,
-            "ac_failed":    cl["ac_failed"],
-            "ai_tools":     cl["ai_tools"],
-            "issuetype":    issuetype,
+            "key": key, "project": proj, "summary": summary,
+            "cycle": cycle, "blocked": blocked, "in_progress": in_progress,
+            "status_log": status_log, "story_points": sp,
+            "fix_versions": fix_versions, "ac_failed": cl["ac_failed"],
+            "ai_tools": cl["ai_tools"], "issuetype": issuetype,
         }
         by_project[proj].append(entry)
         all_tickets.append(entry)
@@ -891,8 +826,8 @@ def run_report(year, month):
     print(f"{'Project':<10} {'Tickets':>7}  {'AVG Cycle':>10}  {'AVG Blocked':>12}")
     print(f"{'─' * 60}")
 
-    results   = []
-    total_w   = total_n = 0
+    results = []
+    total_w = total_n = 0
 
     for proj in PROJECTS:
         items = by_project.get(proj, [])
@@ -922,8 +857,7 @@ def run_report(year, month):
         efficiency      = round(total_inprog_wd / total_cycle_wd * 100) if total_cycle_wd > 0 else None
 
         results.append({
-            "project":           proj,
-            "count":             len(items),
+            "project": proj, "count": len(items),
             "avg":               round(avg_c, 1) if avg_c is not None else None,
             "avg_blocked":       round(avg_b, 1),
             "throughput_sp":     tput_sp,
@@ -944,28 +878,26 @@ def run_report(year, month):
     print(f"{'OVERALL':<10} {total_n:>7}  {overall:>9.1f}wd")
     print(f"{'─' * 60}")
     print("\n✅ Working days only · SP > 0 or Fix Version · "
-          "Ready, Blocked & Test Blocked excluded · PT holidays excluded")
+          "Ready/Ready for Testing/Blocked & Test Blocked excluded · PT holidays excluded")
 
     print("\n4. Fetching open bugs...")
-    open_bugs  = get_open_bugs()
+    open_bugs = get_open_bugs()
     print(f"   ✅ {open_bugs['total']} open bugs/defects found")
     for proj, n in open_bugs["by_project"].items():
         print(f"      {proj}: {n}")
 
     print("\n5. Generating Excel...")
-    excel_file = export_excel(results, all_tickets, year, month, weeks)
+    excel_file = export_excel(results, all_tickets, label, weeks, end_dt)
 
     print("\n6. Uploading to Confluence...")
     confluence_url = upload_to_confluence(excel_file)
 
     return {
-        "label":          label,
-        "projects":       results,
-        "total":          total_n,
-        "overall":        round(overall, 1),
-        "weeks":          round(weeks, 1),
+        "label": label, "projects": results,
+        "total": total_n, "overall": round(overall, 1),
+        "weeks": round(weeks, 1),
         "confluence_url": confluence_url,
-        "open_bugs":      open_bugs,
+        "open_bugs": open_bugs,
     }
 
 
@@ -973,12 +905,13 @@ def run_report(year, month):
 
 if __name__ == "__main__":
     import sys
-    today = date.today()
-    year  = today.year if today.month > 1 else today.year - 1
-    month = today.month - 1 or 12
 
-    if len(sys.argv) == 3:
-        year, month = int(sys.argv[1]), int(sys.argv[2])
+    # Default: last 12 weeks ending today
+    # Optional override: python cycle_time.py 2026-10-13  (end date YYYY-MM-DD)
+    if len(sys.argv) == 2:
+        week_end = date.fromisoformat(sys.argv[1])
+    else:
+        week_end = date.today()
 
-    report = run_report(year, month)
+    report = run_report(week_end_date=week_end)
     post_to_slack(report, confluence_url=report.get("confluence_url"))
